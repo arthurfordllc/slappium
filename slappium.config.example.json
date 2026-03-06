@@ -1,0 +1,26 @@
+{
+  "appiumUrl": "http://127.0.0.1:4723",
+  "capabilities": {
+    "platformName": "iOS",
+    "appium:automationName": "XCUITest",
+    "appium:udid": "YOUR_SIMULATOR_UDID",
+    "appium:bundleId": "com.your.app",
+    "appium:noReset": true,
+    "appium:shouldTerminateApp": false,
+    "appium:forceAppLaunch": false,
+    "appium:newCommandTimeout": 600,
+    "appium:wdaLaunchTimeout": 120000,
+    "appium:wdaConnectionTimeout": 120000
+  },
+  "defaults": {
+    "timeout": 5000,
+    "pollInterval": 300,
+    "screenshotDir": "/tmp",
+    "maxScrollAttempts": 10
+  },
+  "login": {
+    "email": "test@example.com",
+    "password": "your-password",
+    "otp": "123456"
+  }
+}

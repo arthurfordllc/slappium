@@ -1,0 +1,2 @@
+#!/bin/bash
+exec node /Users/andrewgillis/Workspaces/Slappium/dist/slap.js "$@"
