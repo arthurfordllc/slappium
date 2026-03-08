@@ -1,12 +1,54 @@
 {
-  "name": "slappium",
+  "name": "@arthurfordllc/slappium",
   "version": "1.0.0",
-  "description": "Lightning-fast iOS testing CLI for AI agents",
+  "description": "Lightning-fast iOS testing CLI for AI agents. Interact with iOS Simulator apps via Appium + simctl with simple tap/type/assert commands.",
   "type": "module",
+  "bin": {
+    "slappium": "dist/slap.js",
+    "slap": "dist/slap.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "slappium.config.example.json",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/slap.js --banner:js='#!/usr/bin/env node'",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai-agent",
+    "testing",
+    "cli",
+    "ios-testing",
+    "appium",
+    "ios-simulator",
+    "llm",
+    "claude",
+    "automation",
+    "mobile-testing",
+    "react-native",
+    "xcuitest",
+    "ai-testing",
+    "developer-tools",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arthurfordllc/slappium.git"
+  },
+  "homepage": "https://github.com/arthurfordllc/slappium",
+  "bugs": {
+    "url": "https://github.com/arthurfordllc/slappium/issues"
+  },
+  "license": "MIT",
+  "author": "Arthur Ford, LLC",
+  "engines": {
+    "node": ">=18"
   },
   "devDependencies": {
     "@types/node": "^25.3.5",
