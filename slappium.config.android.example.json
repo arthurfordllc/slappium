@@ -1,0 +1,24 @@
+{
+  "platform": "android",
+  "appiumUrl": "http://127.0.0.1:4723",
+  "capabilities": {
+    "platformName": "Android",
+    "appium:automationName": "UiAutomator2",
+    "appium:udid": "emulator-5554",
+    "appium:appPackage": "com.your.app",
+    "appium:appActivity": ".MainActivity",
+    "appium:noReset": true,
+    "appium:newCommandTimeout": 600
+  },
+  "defaults": {
+    "timeout": 5000,
+    "pollInterval": 300,
+    "screenshotDir": "/tmp",
+    "maxScrollAttempts": 10
+  },
+  "login": {
+    "email": "test@example.com",
+    "password": "your-password",
+    "otp": "123456"
+  }
+}

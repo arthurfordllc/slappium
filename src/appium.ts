@@ -8,6 +8,7 @@ import { extractTestIDs } from "./tree";
 export interface AppiumConfig {
   appiumUrl: string;
   capabilities: Record<string, unknown>;
+  platform?: "ios" | "android";
   defaults: {
     timeout: number;
     pollInterval: number;
@@ -117,8 +118,10 @@ export function createAppium(
     const sid = await ensureSession();
     const deadline = Date.now() + (timeout ?? config.defaults.timeout);
     const poll = config.defaults.pollInterval;
+    const isAndroid = config.platform === "android";
 
     while (Date.now() < deadline) {
+      // Try accessibility id first (works on both platforms)
       const resp = await fetcher(`${appiumUrl}/session/${sid}/element`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -128,6 +131,23 @@ export function createAppium(
 
       if (data.value && !data.value.error) {
         return extractElementId(data.value);
+      }
+
+      // On Android, fall back to UiAutomator resourceId (React Native maps testID → resource-id)
+      if (isAndroid) {
+        const resp2 = await fetcher(`${appiumUrl}/session/${sid}/element`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            using: "-android uiautomator",
+            value: `new UiSelector().resourceId("${testID}")`,
+          }),
+        });
+        const data2 = await resp2.json() as { value: Record<string, unknown> };
+
+        if (data2.value && !data2.value.error) {
+          return extractElementId(data2.value);
+        }
       }
 
       if (Date.now() + poll >= deadline) break;
@@ -174,6 +194,39 @@ export function createAppium(
     }
 
     throw new ElementNotFoundError(predicate, timeout ?? config.defaults.timeout, []);
+  }
+
+  async function findByText(
+    text: string,
+    timeout?: number
+  ): Promise<string> {
+    const isAndroid = config.platform === "android";
+    const using = isAndroid ? "-android uiautomator" : "-ios predicate string";
+    const value = isAndroid
+      ? `new UiSelector().text("${text}").enabled(true)`
+      : `label == '${text}' AND visible == true`;
+
+    const sid = await ensureSession();
+    const deadline = Date.now() + (timeout ?? config.defaults.timeout);
+    const poll = config.defaults.pollInterval;
+
+    while (Date.now() < deadline) {
+      const resp = await fetcher(`${appiumUrl}/session/${sid}/element`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ using, value }),
+      });
+      const data = await resp.json() as { value: Record<string, unknown> };
+
+      if (data.value && !data.value.error) {
+        return extractElementId(data.value);
+      }
+
+      if (Date.now() + poll >= deadline) break;
+      await sleep(poll);
+    }
+
+    throw new ElementNotFoundError(text, timeout ?? config.defaults.timeout, []);
   }
 
   // --- Element Actions ---
@@ -251,6 +304,7 @@ export function createAppium(
     ensureSession,
     findElement,
     findByPredicate,
+    findByText,
     click,
     clear,
     setValue,

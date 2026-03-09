@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.tsbuildinfo
 slappium.config.json
+slappium.config.ios.json
+docs/plans/

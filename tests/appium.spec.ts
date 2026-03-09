@@ -395,4 +395,195 @@ describe("appium client", () => {
       expect(source).toBe(xml);
     });
   });
+
+  describe("findElement — Android", () => {
+    it("uses accessibility id first, falls back to UiAutomator resourceId on Android", async () => {
+      let callCount = 0;
+      const fetcher = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+        if (url.endsWith("/element") && opts?.method === "POST") {
+          callCount++;
+          const body = JSON.parse(opts.body as string);
+          // accessibility id fails
+          if (body.using === "accessibility id") {
+            return Promise.resolve(
+              mockResponse({ value: { error: "no such element", message: "not found" } })
+            );
+          }
+          // UiAutomator resourceId succeeds
+          if (body.using === "-android uiautomator" && body.value.includes("resourceId")) {
+            return Promise.resolve(
+              mockResponse({ value: { ELEMENT: "el-via-resourceid" } })
+            );
+          }
+          return Promise.resolve(
+            mockResponse({ value: { error: "no such element", message: "not found" } })
+          );
+        }
+        return Promise.resolve(mockResponse({ value: { sessionId: "sess-1" } }));
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { platformName: "Android" },
+          platform: "android",
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      const elId = await client.findElement("email-input");
+      expect(elId).toBe("el-via-resourceid");
+    });
+
+    it("uses accessibility id when it succeeds on Android (no fallback needed)", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+        if (url.endsWith("/element") && opts?.method === "POST") {
+          return Promise.resolve(
+            mockResponse({ value: { ELEMENT: "el-via-a11y" } })
+          );
+        }
+        return Promise.resolve(mockResponse({ value: { sessionId: "sess-1" } }));
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { platformName: "Android" },
+          platform: "android",
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      const elId = await client.findElement("sign-out-btn");
+      expect(elId).toBe("el-via-a11y");
+      // Should only call element endpoint once (accessibility id succeeded)
+      const elementCalls = fetcher.mock.calls.filter(
+        (c: [string, RequestInit?]) => c[0].endsWith("/element")
+      );
+      expect(elementCalls.length).toBe(1);
+    });
+
+    it("still uses only accessibility id when platform is ios", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+        if (url.endsWith("/element") && opts?.method === "POST") {
+          return Promise.resolve(
+            mockResponse({ value: { ELEMENT: "el-ios" } })
+          );
+        }
+        return Promise.resolve(mockResponse({ value: { sessionId: "sess-1" } }));
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { platformName: "iOS" },
+          platform: "ios",
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      await client.findElement("save-btn");
+      const body = JSON.parse(fetcher.mock.calls[1][1].body);
+      expect(body.using).toBe("accessibility id");
+    });
+  });
+
+  describe("findByText", () => {
+    it("uses iOS predicate string when platform is ios", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string) => {
+        if (url.endsWith("/element")) {
+          return Promise.resolve(
+            mockResponse({ value: { ELEMENT: "el-text" } })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { platformName: "iOS" },
+          platform: "ios",
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      await client.findByText("Back");
+      const body = JSON.parse(fetcher.mock.calls[1][1].body);
+      expect(body.using).toBe("-ios predicate string");
+      expect(body.value).toContain("Back");
+    });
+
+    it("uses android uiautomator when platform is android", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string) => {
+        if (url.endsWith("/element")) {
+          return Promise.resolve(
+            mockResponse({ value: { ELEMENT: "el-text" } })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { platformName: "Android" },
+          platform: "android",
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      await client.findByText("Back");
+      const body = JSON.parse(fetcher.mock.calls[1][1].body);
+      expect(body.using).toBe("-android uiautomator");
+      expect(body.value).toContain("Back");
+    });
+
+    it("defaults to ios when platform not specified", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string) => {
+        if (url.endsWith("/element")) {
+          return Promise.resolve(
+            mockResponse({ value: { ELEMENT: "el-text" } })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { platformName: "iOS" },
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      await client.findByText("Submit");
+      const body = JSON.parse(fetcher.mock.calls[1][1].body);
+      expect(body.using).toBe("-ios predicate string");
+    });
+  });
 });

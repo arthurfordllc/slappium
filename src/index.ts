@@ -1,5 +1,5 @@
 /**
- * Slappium CLI — Lightning-fast iOS testing for AI agents.
+ * Slappium CLI — Lightning-fast mobile testing for AI agents.
  *
  * Usage: slap <command> [args...]
  */
@@ -10,11 +10,13 @@ import { fileURLToPath } from "url";
 import { createAppium, ElementNotFoundError, type SessionStore } from "./appium";
 import { parseTree } from "./tree";
 import { createSimctl } from "./simctl";
+import { createAdb, type Adb } from "./adb";
 import { ok, fail, info, formatDuration } from "./fmt";
 
 // --- Config Loading ---
 
 interface SlappiumConfig {
+  platform?: "ios" | "android";
   appiumUrl: string;
   capabilities: Record<string, unknown>;
   defaults: {
@@ -50,22 +52,29 @@ function loadConfig(): SlappiumConfig {
 
 // --- Session File Store ---
 
-const SESSION_FILE = "/tmp/slappium-session.json";
-
-function createFileSessionStore(): SessionStore {
+function createFileSessionStore(platform: string): SessionStore {
+  const sessionFile = `/tmp/slappium-${platform}-session.json`;
   return {
     readSession: () => {
       try {
-        const data = JSON.parse(readFileSync(SESSION_FILE, "utf-8")) as { sessionId: string };
+        const data = JSON.parse(readFileSync(sessionFile, "utf-8")) as { sessionId: string };
         return data.sessionId;
       } catch {
         return null;
       }
     },
     writeSession: (id: string) => {
-      writeFileSync(SESSION_FILE, JSON.stringify({ sessionId: id, createdAt: new Date().toISOString() }));
+      writeFileSync(sessionFile, JSON.stringify({ sessionId: id, createdAt: new Date().toISOString() }));
     },
   };
+}
+
+// --- Platform Context ---
+
+interface PlatformCtx {
+  platform: "ios" | "android";
+  screenshot: (name?: string) => string;
+  adb: Adb | null;
 }
 
 // --- Command Implementations ---
@@ -104,8 +113,7 @@ async function cmdTapText(
   timeout?: number
 ): Promise<void> {
   const start = Date.now();
-  const predicate = `label == '${text}' AND visible == true`;
-  const elId = await client.findByPredicate(predicate, timeout);
+  const elId = await client.findByText(text, timeout);
   const sid = client.getSessionId()!;
   await client.click(sid, elId);
   console.log(ok(`tapped "${text}"`, Date.now() - start));
@@ -141,8 +149,13 @@ async function cmdOtp(
   console.log(ok(`entered OTP ${digits}`, Date.now() - start));
 }
 
-async function cmdBack(client: ReturnType<typeof createAppium>): Promise<void> {
+async function cmdBack(
+  client: ReturnType<typeof createAppium>,
+  ctx: PlatformCtx
+): Promise<void> {
   const start = Date.now();
+
+  // Try testID first (both platforms)
   try {
     const elId = await client.findElement("back-btn", 1000);
     const sid = client.getSessionId()!;
@@ -150,12 +163,19 @@ async function cmdBack(client: ReturnType<typeof createAppium>): Promise<void> {
     console.log(ok("navigated back", Date.now() - start));
     return;
   } catch {
-    // Fallback: try label
+    // Fallback varies by platform
   }
 
+  if (ctx.platform === "android" && ctx.adb) {
+    // Android: hardware back button
+    ctx.adb.pressBack();
+    console.log(ok("navigated back (hardware)", Date.now() - start));
+    return;
+  }
+
+  // iOS: try label
   try {
-    const predicate = "label == 'Back' AND visible == true";
-    const elId = await client.findByPredicate(predicate, 1000);
+    const elId = await client.findByText("Back", 1000);
     const sid = client.getSessionId()!;
     await client.click(sid, elId);
     console.log(ok("navigated back", Date.now() - start));
@@ -261,18 +281,36 @@ async function cmdAssertNot(
   }
 }
 
+async function scrollOnce(
+  client: ReturnType<typeof createAppium>,
+  sid: string,
+  direction: string,
+  platform: string
+): Promise<void> {
+  if (platform === "android") {
+    await client.executeScript(sid, "mobile: scrollGesture", [{
+      left: 100, top: 300, width: 800, height: 1500,
+      direction, percent: 0.75,
+    }]);
+  } else {
+    await client.executeScript(sid, "mobile: scroll", [{ direction }]);
+  }
+}
+
 async function cmdScroll(
   client: ReturnType<typeof createAppium>,
-  direction: string
+  direction: string,
+  ctx: PlatformCtx
 ): Promise<void> {
   const sid = await client.ensureSession();
-  await client.executeScript(sid, "mobile: scroll", [{ direction }]);
+  await scrollOnce(client, sid, direction, ctx.platform);
   console.log(ok(`scrolled ${direction}`));
 }
 
 async function cmdScrollTo(
   client: ReturnType<typeof createAppium>,
   testID: string,
+  ctx: PlatformCtx,
   maxAttempts = 10
 ): Promise<void> {
   const start = Date.now();
@@ -284,7 +322,7 @@ async function cmdScrollTo(
       console.log(ok(`scrolled to ${testID} (${i} scrolls)`, Date.now() - start));
       return;
     } catch {
-      await client.executeScript(sid, "mobile: scroll", [{ direction: "down" }]);
+      await scrollOnce(client, sid, "down", ctx.platform);
     }
   }
 
@@ -294,13 +332,13 @@ async function cmdScrollTo(
 
 async function cmdPeek(
   client: ReturnType<typeof createAppium>,
-  simctl: ReturnType<typeof createSimctl>
+  ctx: PlatformCtx
 ): Promise<void> {
   const sid = await client.ensureSession();
 
   // Run screenshot and source fetch in parallel
   const [screenshotPath, source] = await Promise.all([
-    Promise.resolve(simctl.screenshot("slap-peek")),
+    Promise.resolve(ctx.screenshot("slap-peek")),
     client.getSource(sid),
   ]);
 
@@ -315,10 +353,10 @@ async function cmdTree(client: ReturnType<typeof createAppium>): Promise<void> {
 }
 
 async function cmdScreenshot(
-  simctl: ReturnType<typeof createSimctl>,
+  ctx: PlatformCtx,
   name?: string
 ): Promise<void> {
-  const path = simctl.screenshot(name);
+  const path = ctx.screenshot(name);
   console.log(path);
 }
 
@@ -351,9 +389,9 @@ async function cmdFind(
   const sid = await client.ensureSession();
   const source = await client.getSource(sid);
 
-  // Search for elements with matching label or value
+  // Search for elements with matching label, value, name, text, or content-desc
   const regex = new RegExp(
-    `(?:label|value|name)="([^"]*${searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"]*)"`,
+    `(?:label|value|name|text|content-desc)="([^"]*${searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"]*)"`,
     "gi"
   );
   const matches: string[] = [];
@@ -399,23 +437,35 @@ async function cmdLogin(
   await cmdWait(client, "otp-digit-0", 10000);
   // Enter OTP
   await cmdOtp(client, o);
-  // Wait for dashboard
-  await cmdWait(client, "dashboard-header", 15000);
+  // Tap verify button
+  await cmdTap(client, "verify-otp-btn");
+  // Wait for OTP screen to disappear
+  await cmdWaitGone(client, "otp-digit-0", 15000);
 
   console.log(ok(`logged in as ${e}`, Date.now() - start));
 }
 
-async function cmdReload(client: ReturnType<typeof createAppium>): Promise<void> {
+async function cmdReload(
+  client: ReturnType<typeof createAppium>,
+  ctx: PlatformCtx
+): Promise<void> {
   const sid = await client.ensureSession();
-  // Shake gesture triggers Metro reload
-  await client.executeScript(sid, "mobile: shake", []);
+  if (ctx.platform === "android") {
+    // Menu key triggers Metro dev menu on Android
+    await client.executeScript(sid, "mobile: shell", [{
+      command: "input", args: ["keyevent", "82"],
+    }]);
+  } else {
+    // Shake gesture triggers Metro reload on iOS
+    await client.executeScript(sid, "mobile: shake", []);
+  }
   console.log(ok("reload triggered"));
 }
 
 async function cmdChain(
   args: string[],
   client: ReturnType<typeof createAppium>,
-  simctl: ReturnType<typeof createSimctl>,
+  ctx: PlatformCtx,
   config: SlappiumConfig
 ): Promise<void> {
   for (const cmdStr of args) {
@@ -423,7 +473,7 @@ async function cmdChain(
     const subcmd = parts[0];
     const subargs = parts.slice(1);
     console.log(info(`→ ${cmdStr}`));
-    await routeCommand(subcmd, subargs, client, simctl, config);
+    await routeCommand(subcmd, subargs, client, ctx, config);
     if (process.exitCode && Number(process.exitCode) > 0) {
       console.log(fail(`chain stopped at: ${cmdStr}`));
       return;
@@ -437,7 +487,7 @@ async function routeCommand(
   command: string,
   args: string[],
   client: ReturnType<typeof createAppium>,
-  simctl: ReturnType<typeof createSimctl>,
+  ctx: PlatformCtx,
   config: SlappiumConfig
 ): Promise<void> {
   switch (command) {
@@ -458,7 +508,7 @@ async function routeCommand(
       if (!args[0]) throw new Error("Usage: slap otp <digits>");
       return cmdOtp(client, args[0]);
     case "back":
-      return cmdBack(client);
+      return cmdBack(client, ctx);
     case "wait":
       if (!args[0]) throw new Error("Usage: slap wait <testID> [timeout]");
       return cmdWait(client, args[0], args[1] ? parseInt(args[1]) : undefined);
@@ -479,16 +529,16 @@ async function routeCommand(
       return cmdAssertNot(client, args[0]);
     case "scroll":
       if (!args[0]) throw new Error("Usage: slap scroll <up|down>");
-      return cmdScroll(client, args[0]);
+      return cmdScroll(client, args[0], ctx);
     case "scroll-to":
       if (!args[0]) throw new Error("Usage: slap scroll-to <testID> [maxScrolls]");
-      return cmdScrollTo(client, args[0], args[1] ? parseInt(args[1]) : undefined);
+      return cmdScrollTo(client, args[0], ctx, args[1] ? parseInt(args[1]) : undefined);
     case "peek":
-      return cmdPeek(client, simctl);
+      return cmdPeek(client, ctx);
     case "tree":
       return cmdTree(client);
     case "screenshot":
-      return cmdScreenshot(simctl, args[0]);
+      return cmdScreenshot(ctx, args[0]);
     case "source":
       return cmdSource(client);
     case "inspect":
@@ -500,9 +550,9 @@ async function routeCommand(
     case "login":
       return cmdLogin(client, config, args[0], args[1], args[2]);
     case "reload":
-      return cmdReload(client);
+      return cmdReload(client, ctx);
     case "chain":
-      return cmdChain(args, client, simctl, config);
+      return cmdChain(args, client, ctx, config);
     default:
       console.log(fail(`unknown command: ${command}`));
       console.log(`
@@ -543,7 +593,7 @@ async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
 
   if (!command) {
-    console.log("slappium v1.0.0 — Lightning-fast iOS testing for AI agents");
+    console.log("slappium v2.0.0 — Lightning-fast mobile testing for AI agents");
     console.log("Usage: slap <command> [args...]");
     console.log("Run 'slap help' for available commands.");
     return;
@@ -555,11 +605,13 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
-  const sessionStore = createFileSessionStore();
+  const platform = config.platform ?? "ios";
+  const sessionStore = createFileSessionStore(platform);
   const client = createAppium(
     {
       appiumUrl: config.appiumUrl,
       capabilities: config.capabilities,
+      platform,
       defaults: {
         timeout: config.defaults.timeout,
         pollInterval: config.defaults.pollInterval,
@@ -568,9 +620,21 @@ async function main(): Promise<void> {
     globalThis.fetch,
     sessionStore
   );
-  const simctl = createSimctl();
 
-  await routeCommand(command, args, client, simctl, config);
+  // Create platform-specific device commands
+  const simctl = platform === "ios" ? createSimctl() : null;
+  const adb = platform === "android" ? createAdb() : null;
+  const ctx: PlatformCtx = {
+    platform,
+    screenshot: (name?: string) => {
+      if (simctl) return simctl.screenshot(name);
+      if (adb) return adb.screenshot(name);
+      throw new Error("No device available for screenshots");
+    },
+    adb,
+  };
+
+  await routeCommand(command, args, client, ctx, config);
 }
 
 main().catch((err) => {

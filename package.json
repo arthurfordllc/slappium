@@ -1,7 +1,7 @@
 {
   "name": "@arthurfordllc/slappium",
-  "version": "1.0.0",
-  "description": "Lightning-fast iOS testing CLI for AI agents. Interact with iOS Simulator apps via Appium + simctl with simple tap/type/assert commands.",
+  "version": "2.0.0",
+  "description": "Lightning-fast iOS & Android testing CLI for AI agents. Interact with mobile apps via Appium with simple tap/type/assert commands.",
   "type": "module",
   "bin": {
     "slappium": "dist/slap.js",
@@ -11,6 +11,7 @@
     "dist",
     "bin",
     "slappium.config.example.json",
+    "slappium.config.android.example.json",
     "LICENSE",
     "README.md"
   ],
@@ -25,14 +26,18 @@
     "testing",
     "cli",
     "ios-testing",
+    "android-testing",
     "appium",
     "ios-simulator",
+    "android-emulator",
     "llm",
     "claude",
     "automation",
     "mobile-testing",
     "react-native",
     "xcuitest",
+    "uiautomator2",
+    "adb",
     "ai-testing",
     "developer-tools",
     "typescript"

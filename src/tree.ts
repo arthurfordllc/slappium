@@ -1,12 +1,13 @@
 /**
- * Parses Appium XCUITest page source XML into a clean, collapsed testID tree.
+ * Parses Appium page source XML into a clean, collapsed testID tree.
+ * Supports both iOS (XCUITest) and Android (UiAutomator2) XML formats.
  *
  * Collapsing rules:
- * - Unnamed wrapper elements (Other, Window, Application) are skipped; children promoted
- * - Interactive elements (Button, TextField, Switch, etc.) always show their type
- * - StaticText shows value in quotes
+ * - Unnamed wrapper elements are skipped; children promoted
+ * - Interactive elements (Button, TextField/EditText, Switch, etc.) always show their type
+ * - StaticText/TextView shows value in quotes
  * - Disabled elements get (disabled) suffix
- * - TextFields show placeholder text
+ * - TextFields/EditTexts show placeholder text
  */
 
 interface TreeNode {
@@ -20,6 +21,7 @@ interface TreeNode {
   children: TreeNode[];
 }
 
+// iOS interactive element types
 const INTERACTIVE_TYPES = new Set([
   "Button",
   "TextField",
@@ -36,6 +38,19 @@ const INTERACTIVE_TYPES = new Set([
   "SearchField",
 ]);
 
+// Android interactive element types
+const ANDROID_INTERACTIVE_TYPES = new Set([
+  "EditText",
+  "Button",
+  "CheckBox",
+  "RadioButton",
+  "Spinner",
+  "SeekBar",
+  "Switch",
+  "ToggleButton",
+]);
+
+// iOS wrapper element types (collapsed when unnamed)
 const WRAPPER_TYPES = new Set([
   "Other",
   "Window",
@@ -46,17 +61,36 @@ const WRAPPER_TYPES = new Set([
   "CollectionView",
 ]);
 
-const SKIP_NAMES = new Set(["CareCoordinate"]);
+// Android wrapper element types (collapsed when unnamed)
+const ANDROID_WRAPPER_TYPES = new Set([
+  "FrameLayout",
+  "LinearLayout",
+  "RelativeLayout",
+  "ConstraintLayout",
+  "ViewGroup",
+  "ScrollView",
+]);
 
-/** Strip "XCUIElementType" prefix */
+// Skip iOS root application element name (always first name= on XCUIElementTypeApplication)
+const SKIP_TYPES = new Set(["Application"]);
+
+/** Strip platform-specific element type prefixes */
 function shortType(raw: string): string {
-  return raw.replace(/^XCUIElementType/, "");
+  return raw
+    .replace(/^XCUIElementType/, "")
+    .replace(/^android\.widget\./, "")
+    .replace(/^android\.view\./, "");
+}
+
+/** Detect whether XML is Android (UiAutomator2) format */
+function isAndroidXML(xml: string): boolean {
+  return xml.slice(0, 200).includes("<hierarchy");
 }
 
 /** Parse XML attributes from a tag string like `name="foo" label="bar"` */
 function parseAttrs(attrString: string): Record<string, string> {
   const attrs: Record<string, string> = {};
-  const re = /(\w+)="([^"]*)"/g;
+  const re = /([\w-]+)="([^"]*)"/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(attrString)) !== null) {
     attrs[match[1]] = match[2];
@@ -64,8 +98,8 @@ function parseAttrs(attrString: string): Record<string, string> {
   return attrs;
 }
 
-/** Recursive descent parser for XCUITest XML */
-function parseXML(xml: string, pos: number): { nodes: TreeNode[]; endPos: number } {
+/** Recursive descent parser for Appium page source XML (iOS + Android) */
+function parseXML(xml: string, pos: number, android: boolean): { nodes: TreeNode[]; endPos: number } {
   const nodes: TreeNode[] = [];
 
   while (pos < xml.length) {
@@ -98,22 +132,42 @@ function parseXML(xml: string, pos: number): { nodes: TreeNode[]; endPos: number
     const attrStr = spaceIdx === -1 ? "" : cleanContent.substring(spaceIdx + 1);
     const attrs = parseAttrs(attrStr);
 
-    const node: TreeNode = {
-      type: shortType(tagName),
-      name: attrs["name"] || null,
-      label: attrs["label"] || null,
-      value: attrs["value"] || null,
-      enabled: attrs["enabled"] !== "false",
-      visible: attrs["visible"] !== "false",
-      placeholder: attrs["placeholderValue"] || null,
-      children: [],
-    };
+    let node: TreeNode;
+
+    if (android) {
+      // Android: resource-id is the primary testID (React Native maps testID → resource-id),
+      // content-desc is fallback (accessibilityLabel). text → label/value, hint → placeholder.
+      const resourceId = attrs["resource-id"] || null;
+      const contentDesc = attrs["content-desc"] || null;
+      node = {
+        type: shortType(tagName),
+        name: resourceId || contentDesc,
+        label: attrs["text"] || null,
+        value: attrs["text"] || null,
+        enabled: attrs["enabled"] !== "false",
+        visible: attrs["displayed"] !== "false",
+        placeholder: attrs["hint"] || null,
+        children: [],
+      };
+    } else {
+      // iOS: name, label, value, placeholderValue, visible
+      node = {
+        type: shortType(tagName),
+        name: attrs["name"] || null,
+        label: attrs["label"] || null,
+        value: attrs["value"] || null,
+        enabled: attrs["enabled"] !== "false",
+        visible: attrs["visible"] !== "false",
+        placeholder: attrs["placeholderValue"] || null,
+        children: [],
+      };
+    }
 
     pos = tagEnd + 1;
 
     if (!selfClosing) {
       // Parse children recursively
-      const result = parseXML(xml, pos);
+      const result = parseXML(xml, pos, android);
       node.children = result.nodes;
       pos = result.endPos;
 
@@ -132,14 +186,14 @@ function parseXML(xml: string, pos: number): { nodes: TreeNode[]; endPos: number
 function renderNode(node: TreeNode, indent: number, lines: string[]): void {
   const pad = "  ".repeat(indent);
   const sType = node.type;
-  const isInteractive = INTERACTIVE_TYPES.has(sType);
-  const isWrapper = WRAPPER_TYPES.has(sType);
-  const isStaticText = sType === "StaticText";
-  const hasName = node.name && !SKIP_NAMES.has(node.name);
-  const isAppiumAUT = sType === "AppiumAUT";
+  const isInteractive = INTERACTIVE_TYPES.has(sType) || ANDROID_INTERACTIVE_TYPES.has(sType);
+  const isWrapper = WRAPPER_TYPES.has(sType) || ANDROID_WRAPPER_TYPES.has(sType);
+  const isStaticText = sType === "StaticText" || sType === "TextView";
+  const hasName = node.name && !SKIP_TYPES.has(sType);
+  const isRootWrapper = sType === "AppiumAUT" || sType === "hierarchy";
 
-  // Skip AppiumAUT wrapper entirely
-  if (isAppiumAUT) {
+  // Skip root wrapper elements entirely
+  if (isRootWrapper) {
     for (const child of node.children) {
       renderNode(child, indent, lines);
     }
@@ -199,12 +253,13 @@ function renderNode(node: TreeNode, indent: number, lines: string[]): void {
   }
 }
 
-/** Parse Appium XCUITest page source XML into a clean testID tree string */
+/** Parse Appium page source XML into a clean testID tree string (iOS + Android) */
 export function parseTree(xml: string): string {
   if (!xml || !xml.trim()) return "";
 
   try {
-    const { nodes } = parseXML(xml, 0);
+    const android = isAndroidXML(xml);
+    const { nodes } = parseXML(xml, 0, android);
     const lines: string[] = [];
     for (const node of nodes) {
       renderNode(node, 0, lines);
@@ -219,13 +274,28 @@ export function parseTree(xml: string): string {
 export function extractTestIDs(xml: string): string[] {
   if (!xml) return [];
 
+  const android = isAndroidXML(xml);
   const ids: string[] = [];
-  const re = /\bname="([^"]+)"/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(xml)) !== null) {
-    const name = match[1];
-    if (!SKIP_NAMES.has(name) && !name.startsWith("XCUIElementType")) {
-      ids.push(name);
+
+  if (android) {
+    // Android: extract both resource-id and content-desc (React Native uses both)
+    for (const attr of ["resource-id", "content-desc"]) {
+      const re = new RegExp(`\\b${attr}="([^"]+)"`, "g");
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(xml)) !== null) {
+        const name = match[1];
+        ids.push(name);
+      }
+    }
+  } else {
+    // iOS: extract name attribute
+    const re = /\bname="([^"]+)"/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(xml)) !== null) {
+      const name = match[1];
+      if (!name.startsWith("XCUIElementType")) {
+        ids.push(name);
+      }
     }
   }
 
