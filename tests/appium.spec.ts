@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createAppium } from "../src/appium";
+import type { PollStrategy } from "../src/polling";
 
 // Mock fetch helper — returns a Response-like object
 function mockResponse(body: unknown, status = 200): Response {
@@ -327,6 +328,90 @@ describe("appium client", () => {
         /not found.*nonexistent/i
       );
     });
+
+    it("includes fuzzy 'did you mean' suggestions in error", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+        if (opts?.method === "POST") {
+          return Promise.resolve(
+            mockResponse({
+              value: { error: "no such element", message: "not found" },
+            })
+          );
+        }
+        if (url.endsWith("/source")) {
+          return Promise.resolve(
+            mockResponse({
+              value: '<XCUIElementTypeButton name="save-btn" label="Save"/><XCUIElementTypeButton name="cancel-btn" label="Cancel"/>',
+            })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 300, pollInterval: 30 },
+        },
+        fetcher,
+        fs
+      );
+
+      try {
+        await client.findElement("save-buton");
+      } catch (err) {
+        const msg = (err as Error).message;
+        expect(msg).toContain("did you mean");
+        expect(msg).toContain("save-btn");
+        return;
+      }
+      throw new Error("Expected findElement to throw");
+    });
+
+    it("uses custom PollStrategy when provided", async () => {
+      let callCount = 0;
+      const fetcher = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+        if (url.endsWith("/element") && opts?.method === "POST") {
+          callCount++;
+          if (callCount < 3) {
+            return Promise.resolve(
+              mockResponse({ value: { error: "no such element" } })
+            );
+          }
+          return Promise.resolve(
+            mockResponse({ value: { ELEMENT: "el-poll" } })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      const delays: number[] = [];
+      const strategy: PollStrategy = {
+        nextDelay() { delays.push(42); return 10; },
+        reset() {},
+      };
+
+      const elId = await client.findElement("test-btn", 2000, strategy);
+      expect(elId).toBe("el-poll");
+      expect(delays.length).toBeGreaterThan(0);
+    });
   });
 
   describe("click", () => {
@@ -584,6 +669,150 @@ describe("appium client", () => {
       await client.findByText("Submit");
       const body = JSON.parse(fetcher.mock.calls[1][1].body);
       expect(body.using).toBe("-ios predicate string");
+    });
+  });
+
+  describe("getWindowSize", () => {
+    it("calls GET /session/{sid}/window/rect and returns width/height", async () => {
+      const fetcher = vi.fn().mockImplementation((url: string) => {
+        if (url.endsWith("/window/rect")) {
+          return Promise.resolve(
+            mockResponse({ value: { width: 390, height: 844, x: 0, y: 0 } })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      const size = await client.getWindowSize("sess-1");
+      expect(size).toEqual({ width: 390, height: 844 });
+      expect(fetcher).toHaveBeenCalledWith(
+        "http://localhost:4723/session/sess-1/window/rect",
+        undefined
+      );
+    });
+
+    it("caches window size after first call", async () => {
+      let rectCalls = 0;
+      const fetcher = vi.fn().mockImplementation((url: string) => {
+        if (url.endsWith("/window/rect")) {
+          rectCalls++;
+          return Promise.resolve(
+            mockResponse({ value: { width: 430, height: 932, x: 0, y: 0 } })
+          );
+        }
+        return Promise.resolve(
+          mockResponse({ value: { sessionId: "sess-1" } })
+        );
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      const size1 = await client.getWindowSize("sess-1");
+      const size2 = await client.getWindowSize("sess-1");
+      expect(size1).toEqual({ width: 430, height: 932 });
+      expect(size2).toEqual({ width: 430, height: 932 });
+      expect(rectCalls).toBe(1); // Only one actual HTTP call
+    });
+  });
+
+  describe("HTTP retry", () => {
+    it("retries on 5xx server error", async () => {
+      let callCount = 0;
+      const fetcher = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(mockResponse({ value: null }, 500));
+        }
+        return Promise.resolve(mockResponse({ value: { sessionId: "sess-1" } }));
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      // isAlive triggers a fetch — first call 500, retry succeeds
+      const alive = await client.isAlive();
+      expect(alive).toBe(true);
+      expect(callCount).toBeGreaterThan(1);
+    });
+
+    it("does NOT retry on 4xx client error", async () => {
+      let callCount = 0;
+      const fetcher = vi.fn().mockImplementation(() => {
+        callCount++;
+        return Promise.resolve(mockResponse({ value: { error: "no such element" } }, 404));
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      // 404 should NOT be retried
+      const alive = await client.isAlive();
+      expect(alive).toBe(false);
+      expect(callCount).toBe(1);
+    });
+
+    it("retries on network error (fetch rejection)", async () => {
+      let callCount = 0;
+      const fetcher = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.reject(new Error("ECONNREFUSED"));
+        }
+        return Promise.resolve(mockResponse({ value: { sessionId: "sess-1" } }));
+      });
+      const fs = createMockFs();
+      fs.stored.sessionId = "sess-1";
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: {},
+          defaults: { timeout: 5000, pollInterval: 300 },
+        },
+        fetcher,
+        fs
+      );
+
+      const alive = await client.isAlive();
+      expect(alive).toBe(true);
+      expect(callCount).toBeGreaterThan(1);
     });
   });
 });

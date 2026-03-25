@@ -270,6 +270,66 @@ export function parseTree(xml: string): string {
   }
 }
 
+// ── FilterableNode adapter ──
+
+import type { FilterableNode } from "./tree-filter";
+
+/** Convert Appium page source XML into FilterableNode[] for use with filterTree. */
+export function toFilterable(xml: string): FilterableNode[] {
+  if (!xml || !xml.trim()) return [];
+
+  try {
+    const android = isAndroidXML(xml);
+    const { nodes } = parseXML(xml, 0, android);
+    return nodes.flatMap((n) => convertTreeNode(n));
+  } catch {
+    return [];
+  }
+}
+
+function convertTreeNode(node: TreeNode): FilterableNode[] {
+  const sType = node.type;
+  const isInteractive = INTERACTIVE_TYPES.has(sType) || ANDROID_INTERACTIVE_TYPES.has(sType);
+  const isWrapper = WRAPPER_TYPES.has(sType) || ANDROID_WRAPPER_TYPES.has(sType);
+  const isRootWrapper = sType === "AppiumAUT" || sType === "hierarchy";
+  const hasName = node.name && !SKIP_TYPES.has(sType);
+
+  // Skip root wrappers — promote children
+  if (isRootWrapper || SKIP_TYPES.has(sType)) {
+    return node.children.flatMap((c) => convertTreeNode(c));
+  }
+
+  // Unnamed wrappers — collapse, promote children
+  if ((isWrapper || (!hasName && !isInteractive)) && sType !== "StaticText" && sType !== "TextView") {
+    return node.children.flatMap((c) => convertTreeNode(c));
+  }
+
+  // Build rendered line (matches renderNode logic)
+  let rendered: string | null = null;
+  if (sType === "StaticText" || sType === "TextView") {
+    const text = node.value || node.label || "";
+    rendered = text ? `"${text}"` : null;
+  } else if (hasName) {
+    let line = `[${node.name}]`;
+    if (isInteractive) line += ` ${sType}`;
+    if (node.label && node.label !== node.name) line += ` "${node.label}"`;
+    if (!node.enabled) line += " (disabled)";
+    rendered = line;
+  } else if (isInteractive) {
+    let line = sType;
+    if (node.label) line += ` "${node.label}"`;
+    if (!node.enabled) line += " (disabled)";
+    rendered = line;
+  }
+
+  return [{
+    identity: hasName ? node.name : null,
+    isInteractive,
+    renderedLine: rendered,
+    children: node.children.flatMap((c) => convertTreeNode(c)),
+  }];
+}
+
 /** Extract all testIDs (accessibility identifiers) from page source XML */
 export function extractTestIDs(xml: string): string[] {
   if (!xml) return [];

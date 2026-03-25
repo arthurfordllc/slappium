@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseTree, extractTestIDs } from "../src/tree";
+import { parseTree, extractTestIDs, toFilterable } from "../src/tree";
 
 // Realistic Appium XCUITest page source fixtures
 const SIMPLE_XML = `<?xml version="1.0" encoding="UTF-8"?>
@@ -301,6 +301,56 @@ describe("tree", () => {
     it("excludes empty resource-id values", () => {
       const ids = extractTestIDs(ANDROID_RESOURCE_ID_XML);
       expect(ids).not.toContain("");
+    });
+  });
+
+  describe("toFilterable", () => {
+    it("converts iOS XML to FilterableNode tree with testIDs as identity", () => {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<XCUIElementTypeApplication name="MyApp">
+  <XCUIElementTypeOther>
+    <XCUIElementTypeButton name="save-btn" label="Save" enabled="true" visible="true"/>
+    <XCUIElementTypeStaticText value="Hello" visible="true"/>
+  </XCUIElementTypeOther>
+</XCUIElementTypeApplication>`;
+
+      const result = toFilterable(xml);
+      // save-btn should be present with identity
+      const btn = result.find((n) => n.identity === "save-btn");
+      expect(btn).toBeDefined();
+      expect(btn!.isInteractive).toBe(true);
+    });
+
+    it("marks interactive elements correctly", () => {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<XCUIElementTypeApplication name="MyApp">
+  <XCUIElementTypeTextField name="email-input" label="Email" enabled="true" visible="true"/>
+  <XCUIElementTypeStaticText name="title" value="Welcome" visible="true"/>
+</XCUIElementTypeApplication>`;
+
+      const result = toFilterable(xml);
+      const input = result.find((n) => n.identity === "email-input");
+      expect(input).toBeDefined();
+      expect(input!.isInteractive).toBe(true);
+    });
+
+    it("returns empty array for empty XML", () => {
+      expect(toFilterable("")).toEqual([]);
+    });
+
+    it("preserves hierarchy through non-collapsed nodes", () => {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<XCUIElementTypeApplication name="MyApp">
+  <XCUIElementTypeNavigationBar name="nav-bar" enabled="true" visible="true">
+    <XCUIElementTypeButton name="back-btn" label="Back" enabled="true" visible="true"/>
+  </XCUIElementTypeNavigationBar>
+</XCUIElementTypeApplication>`;
+
+      const result = toFilterable(xml);
+      const nav = result.find((n) => n.identity === "nav-bar");
+      expect(nav).toBeDefined();
+      expect(nav!.children.length).toBeGreaterThan(0);
+      expect(nav!.children[0].identity).toBe("back-btn");
     });
   });
 });

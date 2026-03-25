@@ -12,6 +12,10 @@ import { parseTree } from "./tree";
 import { createSimctl } from "./simctl";
 import { createAdb, type Adb } from "./adb";
 import { ok, fail, info, formatDuration } from "./fmt";
+import { parseTextAndTimeout, parseFlags } from "./args";
+import { toFilterable } from "./tree";
+import { filterTree, type TreeFilter, type FilterableNode } from "./tree-filter";
+import { diffLines, formatDiff } from "./diff";
 
 // --- Config Loading ---
 
@@ -281,6 +285,37 @@ async function cmdAssertNot(
   }
 }
 
+async function cmdAssertAll(
+  client: ReturnType<typeof createAppium>,
+  testIDs: string[]
+): Promise<void> {
+  const results = await Promise.allSettled(
+    testIDs.map((id) => client.findElement(id, 500))
+  );
+
+  const passed: string[] = [];
+  const failed: string[] = [];
+  for (let i = 0; i < testIDs.length; i++) {
+    if (results[i].status === "fulfilled") {
+      passed.push(testIDs[i]);
+    } else {
+      failed.push(testIDs[i]);
+    }
+  }
+
+  if (passed.length > 0) {
+    console.log(ok(`visible: ${passed.join(", ")}`));
+  }
+  if (failed.length > 0) {
+    console.log(fail(`not visible: ${failed.join(", ")}`));
+  }
+  console.log(`── ${passed.length}/${testIDs.length} passed`);
+
+  if (failed.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
 async function scrollOnce(
   client: ReturnType<typeof createAppium>,
   sid: string,
@@ -288,8 +323,14 @@ async function scrollOnce(
   platform: string
 ): Promise<void> {
   if (platform === "android") {
+    const size = await client.getWindowSize(sid);
+    const margin = 0.1;
+    const left = Math.round(size.width * margin);
+    const top = Math.round(size.height * 0.2);
+    const width = Math.round(size.width * (1 - 2 * margin));
+    const height = Math.round(size.height * 0.6);
     await client.executeScript(sid, "mobile: scrollGesture", [{
-      left: 100, top: 300, width: 800, height: 1500,
+      left, top, width, height,
       direction, percent: 0.75,
     }]);
   } else {
@@ -330,9 +371,31 @@ async function cmdScrollTo(
   process.exitCode = 1;
 }
 
+async function cmdScrollPeek(
+  client: ReturnType<typeof createAppium>,
+  direction: string,
+  ctx: PlatformCtx
+): Promise<void> {
+  await cmdScroll(client, direction, ctx);
+  await cmdPeek(client, ctx);
+}
+
+async function cmdScrollToPeek(
+  client: ReturnType<typeof createAppium>,
+  testID: string,
+  ctx: PlatformCtx
+): Promise<void> {
+  await cmdScrollTo(client, testID, ctx);
+  await cmdPeek(client, ctx);
+}
+
+const LAST_TREE_PATH = "/tmp/slappium-last-tree.txt";
+
 async function cmdPeek(
   client: ReturnType<typeof createAppium>,
-  ctx: PlatformCtx
+  ctx: PlatformCtx,
+  filter?: TreeFilter,
+  showDiff = false
 ): Promise<void> {
   const sid = await client.ensureSession();
 
@@ -343,13 +406,55 @@ async function cmdPeek(
   ]);
 
   console.log(`\u{1F4F8} ${screenshotPath}\n`);
-  console.log(parseTree(source));
+
+  let tree: string;
+  if (filter && (filter.interactive || filter.section || filter.around)) {
+    const filterable = toFilterable(source);
+    const filtered = filterTree(filterable, filter);
+    tree = renderFilterable(filtered, 0);
+  } else {
+    tree = parseTree(source);
+  }
+
+  if (showDiff) {
+    let previousLines: string[] = [];
+    try {
+      if (existsSync(LAST_TREE_PATH)) {
+        previousLines = readFileSync(LAST_TREE_PATH, "utf-8").split("\n");
+      }
+    } catch { /* no previous tree */ }
+
+    const currentLines = tree.split("\n");
+    const diffs = diffLines(previousLines, currentLines);
+    console.log(formatDiff(diffs));
+  } else {
+    console.log(tree);
+  }
+
+  writeFileSync(LAST_TREE_PATH, tree);
+}
+
+/** Render FilterableNode[] to indented text lines. */
+function renderFilterable(nodes: FilterableNode[], depth: number): string {
+  const lines: string[] = [];
+  for (const node of nodes) {
+    if (node.renderedLine) {
+      lines.push("  ".repeat(depth) + node.renderedLine);
+    }
+    if (node.children.length > 0) {
+      const childDepth = node.renderedLine ? depth + 1 : depth;
+      lines.push(renderFilterable(node.children, childDepth));
+    }
+  }
+  return lines.join("\n");
 }
 
 async function cmdTree(client: ReturnType<typeof createAppium>): Promise<void> {
   const sid = await client.ensureSession();
   const source = await client.getSource(sid);
-  console.log(parseTree(source));
+  const tree = parseTree(source);
+  console.log(tree);
+  writeFileSync(LAST_TREE_PATH, tree);
 }
 
 async function cmdScreenshot(
@@ -498,9 +603,11 @@ async function routeCommand(
     case "tap":
       if (!args[0]) throw new Error("Usage: slap tap <testID>");
       return cmdTap(client, args[0], args[1] ? parseInt(args[1]) : undefined);
-    case "tap-text":
-      if (!args[0]) throw new Error('Usage: slap tap-text "<text>"');
-      return cmdTapText(client, args.join(" "), args[1] ? parseInt(args[1]) : undefined);
+    case "tap-text": {
+      if (!args[0]) throw new Error('Usage: slap tap-text "<text>" [timeout]');
+      const { text: tapText, timeout: tapTimeout } = parseTextAndTimeout(args);
+      return cmdTapText(client, tapText, tapTimeout);
+    }
     case "type":
       if (!args[0] || !args[1]) throw new Error("Usage: slap type <testID> <text>");
       return cmdType(client, args[0], args.slice(1).join(" "));
@@ -512,29 +619,48 @@ async function routeCommand(
     case "wait":
       if (!args[0]) throw new Error("Usage: slap wait <testID> [timeout]");
       return cmdWait(client, args[0], args[1] ? parseInt(args[1]) : undefined);
-    case "wait-text":
+    case "wait-text": {
       if (!args[0]) throw new Error('Usage: slap wait-text "<text>" [timeout]');
-      return cmdWaitText(client, args[0], args[1] ? parseInt(args[1]) : undefined);
+      const { text: waitTextLabel, timeout: waitTextTimeout } = parseTextAndTimeout(args);
+      return cmdWaitText(client, waitTextLabel, waitTextTimeout);
+    }
     case "wait-gone":
       if (!args[0]) throw new Error("Usage: slap wait-gone <testID> [timeout]");
       return cmdWaitGone(client, args[0], args[1] ? parseInt(args[1]) : undefined);
     case "assert":
       if (!args[0]) throw new Error("Usage: slap assert <testID>");
       return cmdAssert(client, args[0]);
-    case "assert-text":
+    case "assert-text": {
       if (!args[0]) throw new Error('Usage: slap assert-text "<text>"');
-      return cmdAssertText(client, args.join(" "));
+      const { text: assertTextLabel } = parseTextAndTimeout(args);
+      return cmdAssertText(client, assertTextLabel);
+    }
     case "assert-not":
       if (!args[0]) throw new Error("Usage: slap assert-not <testID>");
       return cmdAssertNot(client, args[0]);
+    case "assert-all":
+      if (args.length === 0) throw new Error("Usage: slap assert-all <testID1> <testID2> ...");
+      return cmdAssertAll(client, args);
     case "scroll":
       if (!args[0]) throw new Error("Usage: slap scroll <up|down>");
       return cmdScroll(client, args[0], ctx);
     case "scroll-to":
       if (!args[0]) throw new Error("Usage: slap scroll-to <testID> [maxScrolls]");
       return cmdScrollTo(client, args[0], ctx, args[1] ? parseInt(args[1]) : undefined);
-    case "peek":
-      return cmdPeek(client, ctx);
+    case "scroll-peek":
+      if (!args[0]) throw new Error("Usage: slap scroll-peek <up|down>");
+      return cmdScrollPeek(client, args[0], ctx);
+    case "scroll-to-peek":
+      if (!args[0]) throw new Error("Usage: slap scroll-to-peek <testID>");
+      return cmdScrollToPeek(client, args[0], ctx);
+    case "peek": {
+      const { flags: peekFlags } = parseFlags(args, ["interactive", "section", "around", "diff"]);
+      const peekFilter: TreeFilter = {};
+      if (peekFlags.interactive) peekFilter.interactive = true;
+      if (typeof peekFlags.section === "string") peekFilter.section = peekFlags.section;
+      if (typeof peekFlags.around === "string") peekFilter.around = peekFlags.around;
+      return cmdPeek(client, ctx, peekFilter, !!peekFlags.diff);
+    }
     case "tree":
       return cmdTree(client);
     case "screenshot":
@@ -544,9 +670,11 @@ async function routeCommand(
     case "inspect":
       if (!args[0]) throw new Error("Usage: slap inspect <testID>");
       return cmdInspect(client, args[0]);
-    case "find":
+    case "find": {
       if (!args[0]) throw new Error('Usage: slap find "<text>"');
-      return cmdFind(client, args.join(" "));
+      const { text: findText } = parseTextAndTimeout(args);
+      return cmdFind(client, findText);
+    }
     case "login":
       return cmdLogin(client, config, args[0], args[1], args[2]);
     case "reload":
@@ -572,9 +700,16 @@ Commands:
   assert <testID>      Assert element is visible
   assert-text "<text>" Assert text is visible
   assert-not <testID>  Assert element is NOT visible
+  assert-all <t1> <t2> Batch assert visibility
   scroll <up|down>     Scroll one page
   scroll-to <testID>   Scroll until element found
-  peek                 Screenshot + tree (best command)
+  scroll-peek <dir>    Scroll + peek in one command
+  scroll-to-peek <id>  Scroll to element + peek
+  peek [flags]         Screenshot + tree (best command)
+    --interactive      Only interactive elements
+    --section <testID> Only subtree under testID
+    --around <testID>  Target + parent + siblings
+    --diff             Show changes since last peek
   tree                 Show element tree
   screenshot [name]    Take screenshot
   source               Raw page source XML

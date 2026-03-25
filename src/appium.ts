@@ -4,6 +4,8 @@
  */
 
 import { extractTestIDs } from "./tree";
+import { AdaptivePoll, FixedPoll, type PollStrategy } from "./polling";
+import { closestMatches } from "./fuzzy";
 
 export interface AppiumConfig {
   appiumUrl: string;
@@ -29,9 +31,13 @@ export class ElementNotFoundError extends Error {
     const idList = availableIDs.length > 0
       ? availableIDs.join(", ")
       : "(none detected)";
-    super(
-      `not found: ${testID} (${(timeoutMs / 1000).toFixed(1)}s)\n  visible: ${idList}`
-    );
+    let msg = `not found: ${testID} (${(timeoutMs / 1000).toFixed(1)}s)`;
+    const suggestions = closestMatches(testID, availableIDs);
+    if (suggestions.length > 0) {
+      msg += `\n  did you mean: ${suggestions.join(", ")}`;
+    }
+    msg += `\n  visible: ${idList}`;
+    super(msg);
     this.name = "ElementNotFoundError";
   }
 }
@@ -55,12 +61,37 @@ function extractElementId(value: Record<string, unknown>): string {
   throw new Error("Could not extract element ID from response");
 }
 
+/** Wrap a fetcher with retry logic: 2 retries for 5xx/network errors, no retry on 4xx. */
+function withRetry(fetcher: Fetcher, maxRetries = 2, baseDelay = 200): Fetcher {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const resp = await fetcher(input, init);
+        if (resp.status >= 500 && attempt < maxRetries) {
+          await sleep(baseDelay * (attempt + 1));
+          continue;
+        }
+        return resp;
+      } catch (err) {
+        lastError = err;
+        if (attempt < maxRetries) {
+          await sleep(baseDelay * (attempt + 1));
+          continue;
+        }
+      }
+    }
+    throw lastError;
+  };
+}
+
 export function createAppium(
   config: AppiumConfig,
-  fetcher: Fetcher = globalThis.fetch,
+  rawFetcher: Fetcher = globalThis.fetch,
   sessionStore?: SessionStore
 ) {
   const { appiumUrl } = config;
+  const fetcher = withRetry(rawFetcher);
 
   // Default file-based session store
   const store: SessionStore = sessionStore ?? {
@@ -113,13 +144,15 @@ export function createAppium(
 
   async function findElement(
     testID: string,
-    timeout?: number
+    timeout?: number,
+    pollStrategy?: PollStrategy
   ): Promise<string> {
     const sid = await ensureSession();
     const deadline = Date.now() + (timeout ?? config.defaults.timeout);
-    const poll = config.defaults.pollInterval;
+    const poller = pollStrategy ?? new AdaptivePoll(50, config.defaults.pollInterval);
     const isAndroid = config.platform === "android";
 
+    poller.reset();
     while (Date.now() < deadline) {
       // Try accessibility id first (works on both platforms)
       const resp = await fetcher(`${appiumUrl}/session/${sid}/element`, {
@@ -150,8 +183,9 @@ export function createAppium(
         }
       }
 
-      if (Date.now() + poll >= deadline) break;
-      await sleep(poll);
+      const delay = poller.nextDelay();
+      if (Date.now() + delay >= deadline) break;
+      await sleep(delay);
     }
 
     // Timeout — gather available testIDs for error message
@@ -172,8 +206,9 @@ export function createAppium(
   ): Promise<string> {
     const sid = await ensureSession();
     const deadline = Date.now() + (timeout ?? config.defaults.timeout);
-    const poll = config.defaults.pollInterval;
+    const poller = new AdaptivePoll(50, config.defaults.pollInterval);
 
+    poller.reset();
     while (Date.now() < deadline) {
       const resp = await fetcher(`${appiumUrl}/session/${sid}/element`, {
         method: "POST",
@@ -189,8 +224,9 @@ export function createAppium(
         return extractElementId(data.value);
       }
 
-      if (Date.now() + poll >= deadline) break;
-      await sleep(poll);
+      const delay = poller.nextDelay();
+      if (Date.now() + delay >= deadline) break;
+      await sleep(delay);
     }
 
     throw new ElementNotFoundError(predicate, timeout ?? config.defaults.timeout, []);
@@ -208,8 +244,9 @@ export function createAppium(
 
     const sid = await ensureSession();
     const deadline = Date.now() + (timeout ?? config.defaults.timeout);
-    const poll = config.defaults.pollInterval;
+    const poller = new AdaptivePoll(50, config.defaults.pollInterval);
 
+    poller.reset();
     while (Date.now() < deadline) {
       const resp = await fetcher(`${appiumUrl}/session/${sid}/element`, {
         method: "POST",
@@ -222,8 +259,9 @@ export function createAppium(
         return extractElementId(data.value);
       }
 
-      if (Date.now() + poll >= deadline) break;
-      await sleep(poll);
+      const delay = poller.nextDelay();
+      if (Date.now() + delay >= deadline) break;
+      await sleep(delay);
     }
 
     throw new ElementNotFoundError(text, timeout ?? config.defaults.timeout, []);
@@ -282,6 +320,18 @@ export function createAppium(
     return data.value;
   }
 
+  // --- Window Size (cached) ---
+
+  let cachedWindowSize: { width: number; height: number } | null = null;
+
+  async function getWindowSize(sessionId: string): Promise<{ width: number; height: number }> {
+    if (cachedWindowSize) return cachedWindowSize;
+    const resp = await fetcher(`${appiumUrl}/session/${sessionId}/window/rect`);
+    const data = await resp.json() as { value: { width: number; height: number } };
+    cachedWindowSize = { width: data.value.width, height: data.value.height };
+    return cachedWindowSize;
+  }
+
   // --- Mobile Commands ---
 
   async function executeScript(
@@ -310,6 +360,7 @@ export function createAppium(
     setValue,
     getAttribute,
     getSource,
+    getWindowSize,
     executeScript,
     getSessionId: () => store.readSession(),
   };
