@@ -4,3 +4,4 @@ dist/
 slappium.config.json
 slappium.config.ios.json
 docs/plans/
+.DS_Store

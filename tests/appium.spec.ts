@@ -815,4 +815,178 @@ describe("appium client", () => {
       expect(callCount).toBeGreaterThan(1);
     });
   });
+
+  /*
+   * 2026-07 field fixes. During a CareCoordinate outage drill the app died
+   * and every command reported "visible: (none detected)" instead of "the
+   * app is not running"; a visible keyboard silently ate the first tap; and
+   * findByText's exact-match predicate couldn't hit tab labels.
+   */
+  describe("app state awareness", () => {
+    function stateClient(state: number, findValue: unknown = { error: "no such element" }) {
+      const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/execute/sync")) {
+          const body = JSON.parse(String(init?.body));
+          if (body.script === "mobile: queryAppState") return mockResponse({ value: state });
+          return mockResponse({ value: null });
+        }
+        if (url.endsWith("/element")) return mockResponse({ value: findValue });
+        if (url.endsWith("/source")) return mockResponse({ value: "<AppiumAUT></AppiumAUT>" });
+        if (url.includes("/session/")) return mockResponse({ value: {} });
+        return mockResponse({ value: { sessionId: "sess-1", capabilities: {} } });
+      });
+      const fs = createMockFs();
+      fs.writeSession("sess-1");
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { "appium:bundleId": "app.example.ios" },
+          defaults: { timeout: 250, pollInterval: 50 },
+        },
+        fetcher as unknown as typeof fetch,
+        fs
+      );
+      return { client, fetcher };
+    }
+
+    it("queryAppState reports the app's state", async () => {
+      const { client } = stateClient(4);
+      const state = await client.queryAppState("sess-1");
+      expect(state).toBe(4);
+    });
+
+    it("findElement reports a dead app instead of '(none detected)'", async () => {
+      const { client } = stateClient(1); // 1 = not running
+      await expect(client.findElement("some-btn", 200)).rejects.toThrow(/not running|relaunch/i);
+    });
+
+    it("findElement still reports not-found when the app is foreground", async () => {
+      const { client } = stateClient(4);
+      await expect(client.findElement("some-btn", 200)).rejects.toThrow(/not found/i);
+    });
+  });
+
+  describe("keyboard helpers", () => {
+    it("isKeyboardShown reads the Appium endpoint", async () => {
+      const fetcher = vi.fn(async (url: string) => {
+        if (url.endsWith("/appium/device/is_keyboard_shown")) return mockResponse({ value: true });
+        return mockResponse({ value: {} });
+      });
+      const fs = createMockFs();
+      fs.writeSession("sess-1");
+      const client = createAppium(
+        { appiumUrl: "http://localhost:4723", capabilities: {}, defaults: { timeout: 250, pollInterval: 50 } },
+        fetcher as unknown as typeof fetch,
+        fs
+      );
+      expect(await client.isKeyboardShown("sess-1")).toBe(true);
+    });
+
+    it("hideKeyboard posts the hide command", async () => {
+      const calls: string[] = [];
+      const fetcher = vi.fn(async (url: string) => {
+        calls.push(url);
+        return mockResponse({ value: null });
+      });
+      const fs = createMockFs();
+      fs.writeSession("sess-1");
+      const client = createAppium(
+        { appiumUrl: "http://localhost:4723", capabilities: {}, defaults: { timeout: 250, pollInterval: 50 } },
+        fetcher as unknown as typeof fetch,
+        fs
+      );
+      await client.hideKeyboard("sess-1");
+      expect(calls.some((u) => u.endsWith("/appium/device/hide_keyboard"))).toBe(true);
+    });
+  });
+
+  describe("findByText matching", () => {
+    it("uses case-insensitive CONTAINS on label OR name for iOS", async () => {
+      let capturedPredicate = "";
+      const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/element")) {
+          const body = JSON.parse(String(init?.body));
+          capturedPredicate = body.value;
+          return mockResponse({ value: { ELEMENT: "el-9" } });
+        }
+        if (url.includes("/session/")) return mockResponse({ value: {} });
+        return mockResponse({ value: { sessionId: "sess-1", capabilities: {} } });
+      });
+      const fs = createMockFs();
+      fs.writeSession("sess-1");
+      const client = createAppium(
+        { appiumUrl: "http://localhost:4723", capabilities: {}, defaults: { timeout: 250, pollInterval: 50 } },
+        fetcher as unknown as typeof fetch,
+        fs
+      );
+
+      const el = await client.findByText("My Care");
+      expect(el).toBe("el-9");
+      expect(capturedPredicate).toMatch(/CONTAINS\[c\]/);
+      expect(capturedPredicate).toContain("label");
+      expect(capturedPredicate).toContain("name");
+    });
+  });
+
+  describe("relaunch and deep link", () => {
+    it("relaunchApp terminates then activates the configured bundle", async () => {
+      const scripts: Array<{ script: string; args: unknown[] }> = [];
+      const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/execute/sync")) {
+          scripts.push(JSON.parse(String(init?.body)));
+          return mockResponse({ value: null });
+        }
+        if (url.includes("/session/")) return mockResponse({ value: {} });
+        return mockResponse({ value: { sessionId: "sess-1", capabilities: {} } });
+      });
+      const fs = createMockFs();
+      fs.writeSession("sess-1");
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { "appium:bundleId": "app.example.ios" },
+          defaults: { timeout: 250, pollInterval: 50 },
+        },
+        fetcher as unknown as typeof fetch,
+        fs
+      );
+
+      await client.relaunchApp();
+
+      expect(scripts[0].script).toBe("mobile: terminateApp");
+      expect(scripts[1].script).toBe("mobile: activateApp");
+      expect((scripts[1].args[0] as { bundleId: string }).bundleId).toBe("app.example.ios");
+    });
+
+    it("openDeepLink passes url and bundleId", async () => {
+      const scripts: Array<{ script: string; args: unknown[] }> = [];
+      const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/execute/sync")) {
+          scripts.push(JSON.parse(String(init?.body)));
+          return mockResponse({ value: null });
+        }
+        if (url.includes("/session/")) return mockResponse({ value: {} });
+        return mockResponse({ value: { sessionId: "sess-1", capabilities: {} } });
+      });
+      const fs = createMockFs();
+      fs.writeSession("sess-1");
+      const client = createAppium(
+        {
+          appiumUrl: "http://localhost:4723",
+          capabilities: { "appium:bundleId": "app.example.ios" },
+          defaults: { timeout: 250, pollInterval: 50 },
+        },
+        fetcher as unknown as typeof fetch,
+        fs
+      );
+
+      await client.openDeepLink("myapp:///settings");
+
+      expect(scripts[0].script).toBe("mobile: deepLink");
+      expect((scripts[0].args[0] as { url: string; bundleId: string })).toEqual({
+        url: "myapp:///settings",
+        bundleId: "app.example.ios",
+      });
+    });
+  });
 });

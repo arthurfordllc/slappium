@@ -42,6 +42,21 @@ export class ElementNotFoundError extends Error {
   }
 }
 
+/**
+ * The app under test is not in the foreground — every "element not found"
+ * would be a lie about the real problem. queryAppState values (XCUITest):
+ * 0 not installed, 1 not running, 2/3 backgrounded, 4 foreground.
+ */
+export class AppNotRunningError extends Error {
+  constructor(appId: string, state: number) {
+    const desc = state === 0 ? "not installed"
+      : state === 1 ? "not running (crashed or terminated)"
+      : "backgrounded";
+    super(`app ${appId} is ${desc} (state=${state}) — try \`slap relaunch\``);
+    this.name = "AppNotRunningError";
+  }
+}
+
 type Fetcher = typeof globalThis.fetch;
 
 function sleep(ms: number): Promise<void> {
@@ -92,6 +107,13 @@ export function createAppium(
 ) {
   const { appiumUrl } = config;
   const fetcher = withRetry(rawFetcher);
+
+  /** The app id under test — iOS bundleId or Android appPackage, from capabilities. */
+  function configuredAppId(): string | null {
+    const caps = config.capabilities;
+    const id = caps["appium:bundleId"] ?? caps["bundleId"] ?? caps["appium:appPackage"] ?? caps["appPackage"];
+    return typeof id === "string" ? id : null;
+  }
 
   // Default file-based session store
   const store: SessionStore = sessionStore ?? {
@@ -188,8 +210,10 @@ export function createAppium(
       await sleep(delay);
     }
 
-    // Timeout — gather available testIDs for error message
+    // Timeout — before blaming the element, check whether the app is even
+    // in the foreground. A dead app used to surface as "(none detected)".
     const sid2 = store.readSession() ?? "";
+    await assertAppForeground(sid2);
     let available: string[] = [];
     try {
       const source = await getSource(sid2);
@@ -198,6 +222,21 @@ export function createAppium(
       // If we can't get source, that's ok — just show empty list
     }
     throw new ElementNotFoundError(testID, timeout ?? config.defaults.timeout, available);
+  }
+
+  /** Throw AppNotRunningError when the configured app is not foreground. Best-effort. */
+  async function assertAppForeground(sessionId: string): Promise<void> {
+    const appId = configuredAppId();
+    if (!appId || !sessionId) return;
+    try {
+      const state = await queryAppState(sessionId);
+      if (state !== null && state < 4) {
+        throw new AppNotRunningError(appId, state);
+      }
+    } catch (err) {
+      if (err instanceof AppNotRunningError) throw err;
+      // State query unsupported/failed — fall through to the normal error.
+    }
   }
 
   async function findByPredicate(
@@ -238,9 +277,13 @@ export function createAppium(
   ): Promise<string> {
     const isAndroid = config.platform === "android";
     const using = isAndroid ? "-android uiautomator" : "-ios predicate string";
+    // Case-insensitive substring match on label OR name — exact-equality
+    // predicates couldn't hit tab labels or text with surrounding chrome.
+    const iosText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const androidText = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     const value = isAndroid
-      ? `new UiSelector().text("${text}").enabled(true)`
-      : `label == '${text}' AND visible == true`;
+      ? `new UiSelector().textContains("${androidText}").enabled(true)`
+      : `(label CONTAINS[c] '${iosText}' OR name CONTAINS[c] '${iosText}') AND visible == true`;
 
     const sid = await ensureSession();
     const deadline = Date.now() + (timeout ?? config.defaults.timeout);
@@ -264,6 +307,7 @@ export function createAppium(
       await sleep(delay);
     }
 
+    await assertAppForeground(store.readSession() ?? "");
     throw new ElementNotFoundError(text, timeout ?? config.defaults.timeout, []);
   }
 
@@ -348,6 +392,64 @@ export function createAppium(
     return data.value;
   }
 
+  // --- App Lifecycle ---
+
+  /** XCUITest/UiAutomator2 app state: 0 not installed, 1 not running, 2/3 background, 4 foreground. */
+  async function queryAppState(sessionId: string): Promise<number | null> {
+    const appId = configuredAppId();
+    if (!appId) return null;
+    const value = await executeScript(sessionId, "mobile: queryAppState", [
+      { bundleId: appId, appId },
+    ]);
+    return typeof value === "number" ? value : null;
+  }
+
+  /** Terminate (best-effort) then activate the configured app — the crash recovery path. */
+  async function relaunchApp(): Promise<void> {
+    const appId = configuredAppId();
+    if (!appId) throw new Error("relaunch requires a bundleId/appPackage capability");
+    const sid = await ensureSession();
+    try {
+      await executeScript(sid, "mobile: terminateApp", [{ bundleId: appId, appId }]);
+    } catch {
+      // Already dead — that's the usual reason we're relaunching.
+    }
+    await executeScript(sid, "mobile: activateApp", [{ bundleId: appId, appId }]);
+  }
+
+  /** Open a deep link in the app under test. */
+  async function openDeepLink(url: string): Promise<void> {
+    const appId = configuredAppId();
+    const sid = await ensureSession();
+    await executeScript(sid, "mobile: deepLink", [
+      appId ? { url, bundleId: appId } : { url },
+    ]);
+  }
+
+  // --- Keyboard ---
+
+  async function isKeyboardShown(sessionId: string): Promise<boolean> {
+    try {
+      const resp = await fetcher(`${appiumUrl}/session/${sessionId}/appium/device/is_keyboard_shown`);
+      const data = await resp.json() as { value: boolean };
+      return data.value === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function hideKeyboard(sessionId: string): Promise<void> {
+    try {
+      await fetcher(`${appiumUrl}/session/${sessionId}/appium/device/hide_keyboard`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch {
+      // Keyboard hiding is best-effort — a tap can still proceed.
+    }
+  }
+
   return {
     createSession,
     isAlive,
@@ -362,6 +464,11 @@ export function createAppium(
     getSource,
     getWindowSize,
     executeScript,
+    queryAppState,
+    relaunchApp,
+    openDeepLink,
+    isKeyboardShown,
+    hideKeyboard,
     getSessionId: () => store.readSession(),
   };
 }

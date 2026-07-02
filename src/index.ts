@@ -91,11 +91,34 @@ async function cmdSession(client: ReturnType<typeof createAppium>): Promise<void
 
 async function cmdStatus(client: ReturnType<typeof createAppium>): Promise<void> {
   const alive = await client.isAlive();
-  if (alive) {
-    console.log(ok("session alive"));
-  } else {
+  if (!alive) {
     console.log(fail("no active session"));
     process.exitCode = 1;
+    return;
+  }
+  const sid = client.getSessionId()!;
+  const state = await client.queryAppState(sid);
+  if (state === null) {
+    console.log(ok("session alive"));
+  } else if (state === 4) {
+    console.log(ok("session alive — app foreground"));
+  } else {
+    console.log(fail(`session alive but app state=${state} (0 not installed, 1 not running, 2/3 background) — try \`slap relaunch\``));
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * A visible keyboard swallows the first tap on anything behind it (iOS
+ * dismiss-on-touch), which reads as a phantom no-op. Dismiss it first.
+ */
+async function dismissKeyboardIfShown(
+  client: ReturnType<typeof createAppium>,
+  sid: string
+): Promise<void> {
+  if (await client.isKeyboardShown(sid)) {
+    await client.hideKeyboard(sid);
+    console.log(info("dismissed keyboard before tap"));
   }
 }
 
@@ -107,6 +130,7 @@ async function cmdTap(
   const start = Date.now();
   const elId = await client.findElement(testID, timeout);
   const sid = client.getSessionId()!;
+  await dismissKeyboardIfShown(client, sid);
   await client.click(sid, elId);
   console.log(ok(`tapped ${testID}`, Date.now() - start));
 }
@@ -119,8 +143,21 @@ async function cmdTapText(
   const start = Date.now();
   const elId = await client.findByText(text, timeout);
   const sid = client.getSessionId()!;
+  await dismissKeyboardIfShown(client, sid);
   await client.click(sid, elId);
   console.log(ok(`tapped "${text}"`, Date.now() - start));
+}
+
+async function cmdRelaunch(client: ReturnType<typeof createAppium>): Promise<void> {
+  const start = Date.now();
+  await client.relaunchApp();
+  console.log(ok("relaunched app", Date.now() - start));
+}
+
+async function cmdOpen(client: ReturnType<typeof createAppium>, url: string): Promise<void> {
+  const start = Date.now();
+  await client.openDeepLink(url);
+  console.log(ok(`opened ${url}`, Date.now() - start));
 }
 
 async function cmdType(
@@ -679,6 +716,11 @@ async function routeCommand(
       return cmdLogin(client, config, args[0], args[1], args[2]);
     case "reload":
       return cmdReload(client, ctx);
+    case "relaunch":
+      return cmdRelaunch(client);
+    case "open":
+      if (!args[0]) throw new Error("Usage: slap open <deep-link-url>");
+      return cmdOpen(client, args[0]);
     case "chain":
       return cmdChain(args, client, ctx, config);
     default:
@@ -717,6 +759,8 @@ Commands:
   find "<text>"        Find elements containing text
   login [email] [pass] [otp]  Full login flow
   reload               Reload Metro bundle
+  relaunch             Terminate + reactivate the app (crash recovery)
+  open <url>           Open a deep link in the app
   chain "cmd1" "cmd2"  Run commands sequentially`);
       process.exitCode = 2;
   }
